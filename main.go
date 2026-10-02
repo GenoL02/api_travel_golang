@@ -65,6 +65,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/apr-rules", aprRulesHandler)
+	mux.HandleFunc("/api/apr-rules-max", aprRulesMaxHandler)
 	mux.HandleFunc("/api/code-t", codeTHandler)
 	mux.HandleFunc("/api/config-t", configTHandler)
 
