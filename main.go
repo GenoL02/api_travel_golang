@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"database/sql"
@@ -27,11 +28,16 @@ func writeError(w http.ResponseWriter, status int, message string) {
 }
 
 func main() {
-	databaseURL, err := loadDatabaseConfig("database.json")
-	if err != nil {
-		log.Fatalf("load database configuration: %v", err)
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		var err error
+		databaseURL, err = loadDatabaseConfig("database.json")
+		if err != nil {
+			log.Fatalf("load database configuration: %v", err)
+		}
 	}
 
+	var err error
 	db, err = sql.Open("pgx", databaseURL)
 	if err != nil {
 		log.Fatalf("open database: %v", err)
@@ -62,13 +68,18 @@ func main() {
 	mux.HandleFunc("/api/code-t", codeTHandler)
 	mux.HandleFunc("/api/config-t", configTHandler)
 
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8081"
+	}
+
 	server := &http.Server{
-		Addr:              ":8081",
+		Addr:              ":" + port,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	log.Println("Server running on :8081")
+	log.Printf("Server running on :%s", port)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server: %v", err)
 	}
