@@ -36,6 +36,49 @@ func TestNormalizeAPRRuleAppliesSAPInitialValues(t *testing.T) {
 	}
 }
 
+func TestApplyAPRRulePatchPreservesOmittedFields(t *testing.T) {
+	rule := APRRule{
+		Bukrs:    "1000",
+		RuleText: "Existing rule",
+		SLAHours: 24,
+		IsActive: true,
+	}
+	fields := map[string]json.RawMessage{
+		"RULE_TEXT": json.RawMessage(`"Updated rule"`),
+		"SLA_HOURS": json.RawMessage(`0`),
+		"IS_ACTIVE": json.RawMessage(`false`),
+		"BUKRS":     json.RawMessage(`""`),
+	}
+
+	if err := applyAPRRulePatch(fields, &rule); err != nil {
+		t.Fatalf("applyAPRRulePatch returned error: %v", err)
+	}
+	if rule.RuleText != "Updated rule" || rule.SLAHours != 0 || rule.IsActive || rule.Bukrs != "" {
+		t.Errorf("explicit values were not applied: %+v", rule)
+	}
+	if rule.DocCat != "" || rule.ApprLevel != "" || rule.AmountMin != "" {
+		t.Errorf("omitted fields were unexpectedly changed: %+v", rule)
+	}
+}
+
+func TestApplyAPRRulePatchRejectsNullAndUnknownFields(t *testing.T) {
+	tests := []struct {
+		name   string
+		fields map[string]json.RawMessage
+	}{
+		{name: "null field", fields: map[string]json.RawMessage{"RULE_TEXT": json.RawMessage(`null`)}},
+		{name: "unknown field", fields: map[string]json.RawMessage{"NOT_A_FIELD": json.RawMessage(`"value"`)}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := applyAPRRulePatch(test.fields, &APRRule{}); err == nil {
+				t.Fatal("applyAPRRulePatch accepted invalid field")
+			}
+		})
+	}
+}
+
 func TestNormalizeAPRRuleRejectsInvalidSAPValues(t *testing.T) {
 	tests := []struct {
 		name string

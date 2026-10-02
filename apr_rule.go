@@ -81,8 +81,10 @@ func aprRulesHandler(w http.ResponseWriter, r *http.Request) {
 		getAPRRules(w, r)
 	case http.MethodPost:
 		createAPRRule(w, r)
+	case http.MethodPut:
+		updateAPRRule(w, r)
 	default:
-		w.Header().Set("Allow", "GET, POST")
+		w.Header().Set("Allow", "GET, POST, PUT")
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
 	}
 }
@@ -233,6 +235,193 @@ func createAPRRule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, rule)
+}
+
+func updateAPRRule(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	decoder := json.NewDecoder(r.Body)
+
+	var fields map[string]json.RawMessage
+	if err := decoder.Decode(&fields); err != nil || fields == nil {
+		writeError(w, http.StatusBadRequest, "Invalid JSON body")
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "Request body must contain a single JSON object")
+		return
+	}
+
+	var key APRRule
+	if err := decodeAPRRulePatchKeys(fields, &key); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := normalizeAPRRuleKey(&key); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		log.Printf("begin update ZTB_APR_RULE transaction: %v", err)
+		writeError(w, http.StatusInternalServerError, "Could not update approval rule")
+		return
+	}
+	defer tx.Rollback()
+
+	var rule APRRule
+	var amountMin, amountMax, wbsOnly, isActive string
+	err = tx.QueryRowContext(r.Context(), `
+		SELECT
+			client, rule_id, COALESCE(bukrs, ''), COALESCE(doc_cat, ''),
+			COALESCE(appr_level, '00'), COALESCE(rule_text, ''),
+			COALESCE(trip_type, ''), COALESCE(amount_min, 0)::text,
+			COALESCE(amount_max, 0)::text, COALESCE(waers, ''),
+			COALESCE(grade_lvl_min, '00'), COALESCE(grade_lvl_max, '00'),
+			COALESCE(dept_id, ''), COALESCE(wbs_only, ' '),
+			COALESCE(approver_type, ''), COALESCE(approver_role, ''),
+			COALESCE(approver_emp, ''), COALESCE(sla_hours, 0),
+			COALESCE(to_char(valid_from, 'YYYY-MM-DD'), '00000000'),
+			COALESCE(to_char(valid_to, 'YYYY-MM-DD'), '00000000'),
+			COALESCE(is_active, ' ')
+		FROM travel.ztb_apr_rule
+		WHERE client = $1 AND rule_id = $2
+		FOR UPDATE
+	`, key.Client, key.RuleID).Scan(
+		&rule.Client, &rule.RuleID, &rule.Bukrs, &rule.DocCat,
+		&rule.ApprLevel, &rule.RuleText, &rule.TripType,
+		&amountMin, &amountMax, &rule.Waers, &rule.GradeLvlMin,
+		&rule.GradeLvlMax, &rule.DeptID, &wbsOnly, &rule.ApproverType,
+		&rule.ApproverRole, &rule.ApproverEmp, &rule.SLAHours,
+		&rule.ValidFrom, &rule.ValidTo, &isActive,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "Approval rule not found")
+		return
+	}
+	if err != nil {
+		log.Printf("read ZTB_APR_RULE row for update: %v", err)
+		writeError(w, http.StatusInternalServerError, "Could not update approval rule")
+		return
+	}
+	rule.AmountMin = json.Number(amountMin)
+	rule.AmountMax = json.Number(amountMax)
+	rule.WBSOnly = wbsOnly == "X"
+	rule.IsActive = isActive == "X"
+
+	if err := applyAPRRulePatch(fields, &rule); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := normalizeAPRRule(&rule); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	_, err = tx.ExecContext(r.Context(), `
+		UPDATE travel.ztb_apr_rule SET
+			bukrs = $3, doc_cat = $4, appr_level = $5, rule_text = $6,
+			trip_type = $7, amount_min = $8, amount_max = $9, waers = $10,
+			grade_lvl_min = $11, grade_lvl_max = $12, dept_id = $13,
+			wbs_only = $14, approver_type = $15, approver_role = $16,
+			approver_emp = $17, sla_hours = $18,
+			valid_from = NULLIF($19, '00000000')::date,
+			valid_to = NULLIF($20, '00000000')::date, is_active = $21
+		WHERE client = $1 AND rule_id = $2
+	`,
+		rule.Client, rule.RuleID, rule.Bukrs, rule.DocCat, rule.ApprLevel,
+		rule.RuleText, rule.TripType, rule.AmountMin.String(), rule.AmountMax.String(),
+		rule.Waers, rule.GradeLvlMin, rule.GradeLvlMax, rule.DeptID,
+		boolToSAP(rule.WBSOnly), rule.ApproverType, rule.ApproverRole,
+		rule.ApproverEmp, rule.SLAHours, rule.ValidFrom, rule.ValidTo,
+		boolToSAP(rule.IsActive),
+	)
+	if err != nil {
+		log.Printf("update ZTB_APR_RULE row: %v", err)
+		writeError(w, http.StatusInternalServerError, "Could not update approval rule")
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		log.Printf("commit update ZTB_APR_RULE transaction: %v", err)
+		writeError(w, http.StatusInternalServerError, "Could not update approval rule")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, rule)
+}
+
+func decodeAPRRulePatchKeys(fields map[string]json.RawMessage, rule *APRRule) error {
+	client, ok := fields["CLIENT"]
+	if !ok {
+		return fmt.Errorf("CLIENT is required to identify the approval rule")
+	}
+	if err := decodePatchValue("CLIENT", client, &rule.Client); err != nil {
+		return err
+	}
+	ruleID, ok := fields["RULE_ID"]
+	if !ok {
+		return fmt.Errorf("RULE_ID is required to identify the approval rule")
+	}
+	return decodePatchValue("RULE_ID", ruleID, &rule.RuleID)
+}
+
+func normalizeAPRRuleKey(rule *APRRule) error {
+	rule.Client = strings.TrimSpace(rule.Client)
+	if utf8.RuneCountInString(rule.Client) != 3 {
+		return fmt.Errorf("CLIENT is required and must be exactly 3 characters")
+	}
+	var err error
+	rule.RuleID, err = normalizeNUMC("RULE_ID", strings.TrimSpace(rule.RuleID), 4)
+	return err
+}
+
+func applyAPRRulePatch(fields map[string]json.RawMessage, rule *APRRule) error {
+	patchers := map[string]func(json.RawMessage) error{
+		"BUKRS":         func(raw json.RawMessage) error { return decodePatchValue("BUKRS", raw, &rule.Bukrs) },
+		"DOC_CAT":       func(raw json.RawMessage) error { return decodePatchValue("DOC_CAT", raw, &rule.DocCat) },
+		"APPR_LEVEL":    func(raw json.RawMessage) error { return decodePatchValue("APPR_LEVEL", raw, &rule.ApprLevel) },
+		"RULE_TEXT":     func(raw json.RawMessage) error { return decodePatchValue("RULE_TEXT", raw, &rule.RuleText) },
+		"TRIP_TYPE":     func(raw json.RawMessage) error { return decodePatchValue("TRIP_TYPE", raw, &rule.TripType) },
+		"AMOUNT_MIN":    func(raw json.RawMessage) error { return decodePatchValue("AMOUNT_MIN", raw, &rule.AmountMin) },
+		"AMOUNT_MAX":    func(raw json.RawMessage) error { return decodePatchValue("AMOUNT_MAX", raw, &rule.AmountMax) },
+		"WAERS":         func(raw json.RawMessage) error { return decodePatchValue("WAERS", raw, &rule.Waers) },
+		"GRADE_LVL_MIN": func(raw json.RawMessage) error { return decodePatchValue("GRADE_LVL_MIN", raw, &rule.GradeLvlMin) },
+		"GRADE_LVL_MAX": func(raw json.RawMessage) error { return decodePatchValue("GRADE_LVL_MAX", raw, &rule.GradeLvlMax) },
+		"DEPT_ID":       func(raw json.RawMessage) error { return decodePatchValue("DEPT_ID", raw, &rule.DeptID) },
+		"WBS_ONLY":      func(raw json.RawMessage) error { return decodePatchValue("WBS_ONLY", raw, &rule.WBSOnly) },
+		"APPROVER_TYPE": func(raw json.RawMessage) error { return decodePatchValue("APPROVER_TYPE", raw, &rule.ApproverType) },
+		"APPROVER_ROLE": func(raw json.RawMessage) error { return decodePatchValue("APPROVER_ROLE", raw, &rule.ApproverRole) },
+		"APPROVER_EMP":  func(raw json.RawMessage) error { return decodePatchValue("APPROVER_EMP", raw, &rule.ApproverEmp) },
+		"SLA_HOURS":     func(raw json.RawMessage) error { return decodePatchValue("SLA_HOURS", raw, &rule.SLAHours) },
+		"VALID_FROM":    func(raw json.RawMessage) error { return decodePatchValue("VALID_FROM", raw, &rule.ValidFrom) },
+		"VALID_TO":      func(raw json.RawMessage) error { return decodePatchValue("VALID_TO", raw, &rule.ValidTo) },
+		"IS_ACTIVE":     func(raw json.RawMessage) error { return decodePatchValue("IS_ACTIVE", raw, &rule.IsActive) },
+	}
+
+	for name, raw := range fields {
+		if name == "CLIENT" || name == "RULE_ID" {
+			continue
+		}
+		patch, ok := patchers[name]
+		if !ok {
+			return fmt.Errorf("unknown field %q", name)
+		}
+		if err := patch(raw); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func decodePatchValue(name string, raw json.RawMessage, target any) error {
+	if strings.TrimSpace(string(raw)) == "null" {
+		return fmt.Errorf("%s cannot be null; omit it to keep the current value", name)
+	}
+	if err := json.Unmarshal(raw, target); err != nil {
+		return fmt.Errorf("invalid value for %s: %w", name, err)
+	}
+	return nil
 }
 
 func normalizeAPRRule(rule *APRRule) error {
